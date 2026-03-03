@@ -6,7 +6,7 @@ class ModelConfig:
     random_seed: int = 123
     data_seed: int = 42
     dataset_root: str = "data"
-    training_mode: str = "fusion"
+    training_mode: str = "iris_only"
     lfw_root: str = r"C:\Users\zhouy\Desktop\研究\lfw"
     casia_iris_root: str = r"C:\Users\zhouy\Desktop\研究\CASIA-Iris-Thousand"
     pairing_mode: str = "public_manual_indexed"
@@ -15,6 +15,7 @@ class ModelConfig:
     checkpoint_name: str = "multimodal_cancelable_public_manual"
     eval_report_dir: str = "eval_reports/public_manual"
     train_steps: int = 128
+    unimodal_train_steps: int = 384
     eval_warmup_steps: int = 4
     eval_batches: int = 8
     eval_identities: int = 16
@@ -31,6 +32,7 @@ class ModelConfig:
     block_size: int = 32
     num_classes: int = 1000
     learning_rate: float = 3e-4
+    unimodal_learning_rate: float = 3e-4
     batch_size: int = 16
     pair_margin: float = 0.20
     pair_positive_target: float = 0.20
@@ -41,6 +43,9 @@ class ModelConfig:
     embedding_pairwise_weight: float = 2.00
     triplet_margin: float = 0.20
     triplet_weight: float = 1.00
+    unimodal_classification_weight: float = 1.00
+    unimodal_embedding_pairwise_weight: float = 0.00
+    unimodal_triplet_weight: float = 0.00
     adaface_margin: float = 0.4
     adaface_scale: float = 32.0
     adaface_h: float = 0.333

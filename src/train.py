@@ -90,7 +90,10 @@ def main() -> None:
         result = train_unimodal_probe(config, modality)
         print("preset:", preset_name)
         print("training_mode:", config.training_mode)
+        print("train_final_loss:", f"{result['train_final_loss']:.4f}")
         print("train_final_cls_loss:", f"{result['train_final_cls_loss']:.4f}")
+        print("train_final_embedding_loss:", f"{result['train_final_embedding_loss']:.4f}")
+        print("train_final_triplet_loss:", f"{result['train_final_triplet_loss']:.4f}")
         print("checkpoint_saved:", result["checkpoint_path"])
         return
 

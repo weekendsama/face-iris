@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
 
 from .data import build_training_batch_iterator, build_training_dataset, collect_evaluation_records
-from .losses import classification_loss
+from .losses import batch_hard_triplet_loss, classification_loss, pairwise_embedding_loss
 from .model import AdaFaceHead, _build_backbone
 from .presets import get_config
 
@@ -34,7 +36,18 @@ def unimodal_checkpoint_path(config, modality: str) -> str:
 
 def _build_unimodal_components(config, modality: str):
     spec = _spec_for(config, modality)
-    backbone = _build_backbone(spec.input_shape, spec.embedding_dim, f"{spec.modality}_probe_backbone")
+    base_backbone = _build_backbone(
+        spec.input_shape,
+        spec.embedding_dim,
+        f"{spec.modality}_probe_backbone_base",
+    )
+    inputs = keras.Input(shape=spec.input_shape, name=f"{spec.modality}_probe_input")
+    x = base_backbone(inputs)
+    x = layers.BatchNormalization(name=f"{spec.modality}_probe_bn_1")(x)
+    x = layers.ReLU(name=f"{spec.modality}_probe_relu")(x)
+    x = layers.Dense(spec.embedding_dim, use_bias=False, name=f"{spec.modality}_probe_proj")(x)
+    outputs = layers.BatchNormalization(name=f"{spec.modality}_probe_bn_2")(x)
+    backbone = keras.Model(inputs, outputs, name=f"{spec.modality}_probe_backbone")
     head = AdaFaceHead(config.num_classes, name=f"{spec.modality}_probe_head")
     return spec, backbone, head
 
@@ -168,20 +181,43 @@ def _records_to_batch(records, config):
 def train_unimodal_probe(config, modality: str) -> dict[str, object]:
     tf.keras.utils.set_random_seed(config.random_seed)
     spec, backbone, head = _build_unimodal_components(config, modality)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=config.unimodal_learning_rate)
     source = _build_training_source(config, spec.modality_index)
 
     final_loss = 0.0
-    for _ in range(config.train_steps):
+    final_cls_loss = 0.0
+    final_embedding_loss = 0.0
+    final_triplet_loss = 0.0
+    for _ in range(config.unimodal_train_steps):
         batch_inputs, labels = next(source)
         with tf.GradientTape() as tape:
             raw_embeddings = backbone(batch_inputs, training=True)
+            embeddings = tf.math.l2_normalize(raw_embeddings, axis=-1)
             logits, norms = head(raw_embeddings)
-            loss = classification_loss(logits, norms, labels, config)
+            cls_loss = classification_loss(logits, norms, labels, config)
+            embedding_loss = pairwise_embedding_loss(
+                embeddings,
+                labels,
+                config.embedding_positive_target,
+                config.embedding_negative_target,
+            )
+            triplet_loss = batch_hard_triplet_loss(
+                embeddings,
+                labels,
+                config.triplet_margin,
+            )
+            loss = (
+                config.unimodal_classification_weight * cls_loss
+                + config.unimodal_embedding_pairwise_weight * embedding_loss
+                + config.unimodal_triplet_weight * triplet_loss
+            )
         variables = backbone.trainable_variables + head.trainable_variables
         grads = tape.gradient(loss, variables)
         optimizer.apply_gradients(zip(grads, variables))
         final_loss = float(loss.numpy())
+        final_cls_loss = float(cls_loss.numpy())
+        final_embedding_loss = float(embedding_loss.numpy())
+        final_triplet_loss = float(triplet_loss.numpy())
 
     save_path = unimodal_checkpoint_path(config, spec.modality)
     tf.io.gfile.makedirs(config.checkpoint_dir)
@@ -190,7 +226,10 @@ def train_unimodal_probe(config, modality: str) -> dict[str, object]:
     return {
         "modality": spec.modality,
         "checkpoint_path": save_path,
-        "train_final_cls_loss": final_loss,
+        "train_final_loss": final_loss,
+        "train_final_cls_loss": final_cls_loss,
+        "train_final_embedding_loss": final_embedding_loss,
+        "train_final_triplet_loss": final_triplet_loss,
     }
 
 
@@ -247,7 +286,10 @@ def main() -> None:
     for modality in ("face", "iris"):
         train_result = train_unimodal_probe(config, modality)
         print("modality:", train_result["modality"])
+        print("train_final_loss:", f"{train_result['train_final_loss']:.4f}")
         print("train_final_cls_loss:", f"{train_result['train_final_cls_loss']:.4f}")
+        print("train_final_embedding_loss:", f"{train_result['train_final_embedding_loss']:.4f}")
+        print("train_final_triplet_loss:", f"{train_result['train_final_triplet_loss']:.4f}")
         print("checkpoint_path:", train_result["checkpoint_path"])
         eval_result = evaluate_unimodal_probe(config, modality)
         _print_evaluation(eval_result)
