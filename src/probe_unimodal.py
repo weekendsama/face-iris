@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import re
 
 import tensorflow as tf
 from tensorflow import keras
@@ -32,6 +34,62 @@ def _spec_for(config, modality: str) -> UnimodalSpec:
 def unimodal_checkpoint_path(config, modality: str) -> str:
     spec = _spec_for(config, modality)
     return f"{config.checkpoint_dir}/{spec.modality}_probe"
+
+
+def versioned_unimodal_checkpoint_path(config, modality: str, step: int) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{unimodal_checkpoint_path(config, modality)}-{timestamp}-step{step:04d}"
+
+
+def latest_unimodal_checkpoint_path(config, modality: str) -> str | None:
+    base_path = unimodal_checkpoint_path(config, modality)
+    pattern = f"{base_path}-*-step*.index"
+    candidates = tf.io.gfile.glob(pattern)
+    if not candidates:
+        if tf.io.gfile.exists(f"{base_path}.index"):
+            return base_path
+        return None
+
+    def _sort_key(path: str) -> tuple[str, int]:
+        match = re.search(r"-(\d{8}-\d{6})-step(\d+)\.index$", path)
+        if not match:
+            return ("", -1)
+        return (match.group(1), int(match.group(2)))
+
+    latest_index = max(candidates, key=_sort_key)
+    return latest_index[: -len(".index")]
+
+
+def _list_unimodal_checkpoint_paths(config, modality: str) -> list[str]:
+    base_path = unimodal_checkpoint_path(config, modality)
+    pattern = f"{base_path}-*-step*.index"
+    candidates = tf.io.gfile.glob(pattern)
+    checkpoint_paths = sorted({path[: -len(".index")] for path in candidates})
+    cached_paths = [path for path in checkpoint_paths if _read_unimodal_eer(path) is not None]
+    if cached_paths:
+        return cached_paths
+    if tf.io.gfile.exists(f"{base_path}.index"):
+        checkpoint_paths.append(base_path)
+    return sorted(set(checkpoint_paths))
+
+
+def _unimodal_metric_path(checkpoint_path: str) -> str:
+    return f"{checkpoint_path}.eer.txt"
+
+
+def _read_unimodal_eer(checkpoint_path: str) -> float | None:
+    metric_path = _unimodal_metric_path(checkpoint_path)
+    if not tf.io.gfile.exists(metric_path):
+        return None
+    content = tf.io.read_file(metric_path).numpy().decode("utf-8").strip()
+    try:
+        return float(content)
+    except ValueError:
+        return None
+
+
+def _write_unimodal_eer(checkpoint_path: str, eer: float) -> None:
+    tf.io.write_file(_unimodal_metric_path(checkpoint_path), f"{eer:.10f}\n")
 
 
 def _build_unimodal_components(config, modality: str):
@@ -106,6 +164,23 @@ def _evaluate_embeddings(embeddings: tf.Tensor, labels: list[int]) -> tuple[floa
     impostor = tf.boolean_mask(similarities, tf.logical_not(same_identity)).numpy().tolist()
     metrics = _compute_far_frr_eer(genuine, impostor)
     return sum(genuine) / len(genuine), sum(impostor) / len(impostor), metrics
+
+
+def _evaluate_checkpoint_embeddings(
+    backbone: keras.Model,
+    head: AdaFaceHead,
+    checkpoint_path: str,
+    eval_inputs: tf.Tensor,
+    labels: list[int],
+) -> tuple[float, float, dict[str, float]] | None:
+    checkpoint = tf.train.Checkpoint(backbone=backbone, head=head)
+    try:
+        checkpoint.restore(checkpoint_path).expect_partial()
+    except ValueError:
+        return None
+    eval_raw = backbone(eval_inputs, training=False)
+    eval_embeddings = tf.math.l2_normalize(eval_raw, axis=-1)
+    return _evaluate_embeddings(eval_embeddings, labels)
 
 
 def _compute_far_frr_eer(
@@ -219,7 +294,11 @@ def train_unimodal_probe(config, modality: str) -> dict[str, object]:
         final_embedding_loss = float(embedding_loss.numpy())
         final_triplet_loss = float(triplet_loss.numpy())
 
-    save_path = unimodal_checkpoint_path(config, spec.modality)
+    save_path = versioned_unimodal_checkpoint_path(
+        config,
+        spec.modality,
+        config.unimodal_train_steps,
+    )
     tf.io.gfile.makedirs(config.checkpoint_dir)
     checkpoint = tf.train.Checkpoint(backbone=backbone, head=head)
     checkpoint.write(save_path)
@@ -245,24 +324,42 @@ def evaluate_unimodal_probe(config, modality: str) -> dict[str, object]:
     raw_embeddings = backbone(eval_inputs, training=False)
     _ = head(raw_embeddings)
 
-    checkpoint_path = unimodal_checkpoint_path(config, spec.modality)
-    index_path = f"{checkpoint_path}.index"
-    if not tf.io.gfile.exists(index_path):
-        raise RuntimeError(f"Unimodal checkpoint not found: {checkpoint_path}")
-
-    checkpoint = tf.train.Checkpoint(backbone=backbone, head=head)
-    checkpoint.restore(checkpoint_path).expect_partial()
-
-    eval_raw = backbone(eval_inputs, training=False)
-    eval_embeddings = tf.math.l2_normalize(eval_raw, axis=-1)
+    checkpoint_paths = _list_unimodal_checkpoint_paths(config, spec.modality)
+    if not checkpoint_paths:
+        raise RuntimeError(f"Unimodal checkpoint not found for modality: {spec.modality}")
     labels = labels_tensor.numpy().tolist()
-    genuine_mean, impostor_mean, metrics = _evaluate_embeddings(eval_embeddings, labels)
+    best_result = None
+    for checkpoint_path in checkpoint_paths:
+        cached_eer = _read_unimodal_eer(checkpoint_path)
+        if cached_eer is not None and best_result is not None and cached_eer >= best_result["metrics"]["eer"]:
+            continue
+        evaluation = _evaluate_checkpoint_embeddings(
+            backbone,
+            head,
+            checkpoint_path,
+            eval_inputs,
+            labels,
+        )
+        if evaluation is None:
+            continue
+        genuine_mean, impostor_mean, metrics = evaluation
+        _write_unimodal_eer(checkpoint_path, metrics["eer"])
+        if best_result is None or metrics["eer"] < best_result["metrics"]["eer"]:
+            best_result = {
+                "checkpoint_path": checkpoint_path,
+                "genuine_mean": genuine_mean,
+                "impostor_mean": impostor_mean,
+                "metrics": metrics,
+            }
+
+    if best_result is None:
+        raise RuntimeError(f"No compatible unimodal checkpoints found for modality: {spec.modality}")
     return {
         "modality": spec.modality,
-        "checkpoint_path": checkpoint_path,
-        "genuine_mean": genuine_mean,
-        "impostor_mean": impostor_mean,
-        "metrics": metrics,
+        "checkpoint_path": best_result["checkpoint_path"],
+        "genuine_mean": best_result["genuine_mean"],
+        "impostor_mean": best_result["impostor_mean"],
+        "metrics": best_result["metrics"],
     }
 
 
