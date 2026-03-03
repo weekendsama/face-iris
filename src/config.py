@@ -16,6 +16,8 @@ class ModelConfig:
     eval_report_dir: str = "eval_reports/public_manual"
     train_steps: int = 128
     unimodal_train_steps: int = 384
+    iris_mobilenet_train_steps: int = 512
+    iris_mobilenet_head_steps: int = 192
     eval_warmup_steps: int = 4
     eval_batches: int = 8
     eval_identities: int = 16
@@ -24,6 +26,10 @@ class ModelConfig:
     train_identity_fraction: float = 0.8
     face_input_shape: tuple[int, int, int] = (224, 224, 3)
     iris_input_shape: tuple[int, int, int] = (128, 128, 1)
+    iris_unimodal_backbone: str = "mobilenet_v3_small"
+    iris_mobilenet_input_size: int = 224
+    iris_mobilenet_alpha: float = 1.0
+    iris_mobilenet_weights: str = "imagenet"
     face_embedding_dim: int = 512
     iris_embedding_dim: int = 128
     shared_embedding_dim: int = 256
@@ -33,6 +39,8 @@ class ModelConfig:
     num_classes: int = 1000
     learning_rate: float = 3e-4
     unimodal_learning_rate: float = 3e-4
+    iris_mobilenet_learning_rate: float = 3e-5
+    iris_mobilenet_finetune_learning_rate: float = 5e-6
     batch_size: int = 16
     pair_margin: float = 0.20
     pair_positive_target: float = 0.20

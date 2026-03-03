@@ -14,6 +14,9 @@ from .model import AdaFaceHead, _build_backbone
 from .presets import get_config
 
 
+UNIMODAL_EER_CACHE_VERSION = "v10"
+
+
 @dataclass(frozen=True)
 class UnimodalSpec:
     modality: str
@@ -33,6 +36,8 @@ def _spec_for(config, modality: str) -> UnimodalSpec:
 
 def unimodal_checkpoint_path(config, modality: str) -> str:
     spec = _spec_for(config, modality)
+    if spec.modality == "iris" and config.iris_unimodal_backbone == "mobilenet_v3_small":
+        return f"{config.checkpoint_dir}/{spec.modality}_probe_mobilenet_v3_small"
     return f"{config.checkpoint_dir}/{spec.modality}_probe"
 
 
@@ -74,7 +79,29 @@ def _list_unimodal_checkpoint_paths(config, modality: str) -> list[str]:
 
 
 def _unimodal_metric_path(checkpoint_path: str) -> str:
-    return f"{checkpoint_path}.eer.txt"
+    return f"{checkpoint_path}.eer.{UNIMODAL_EER_CACHE_VERSION}.txt"
+
+
+def _unimodal_best_path(config, modality: str) -> str:
+    return f"{unimodal_checkpoint_path(config, modality)}.best.{UNIMODAL_EER_CACHE_VERSION}.txt"
+
+
+def _read_unimodal_best_checkpoint(config, modality: str) -> str | None:
+    best_path = _unimodal_best_path(config, modality)
+    if not tf.io.gfile.exists(best_path):
+        return None
+    checkpoint_path = tf.io.read_file(best_path).numpy().decode("utf-8").strip()
+    if not checkpoint_path:
+        return None
+    if not tf.io.gfile.exists(f"{checkpoint_path}.index"):
+        return None
+    if _read_unimodal_eer(checkpoint_path) is None:
+        return None
+    return checkpoint_path
+
+
+def _write_unimodal_best_checkpoint(config, modality: str, checkpoint_path: str) -> None:
+    tf.io.write_file(_unimodal_best_path(config, modality), f"{checkpoint_path}\n")
 
 
 def _read_unimodal_eer(checkpoint_path: str) -> float | None:
@@ -94,18 +121,43 @@ def _write_unimodal_eer(checkpoint_path: str, eer: float) -> None:
 
 def _build_unimodal_components(config, modality: str):
     spec = _spec_for(config, modality)
-    base_backbone = _build_backbone(
-        spec.input_shape,
-        spec.embedding_dim,
-        f"{spec.modality}_probe_backbone_base",
-    )
     inputs = keras.Input(shape=spec.input_shape, name=f"{spec.modality}_probe_input")
-    x = base_backbone(inputs)
+    feature_extractor = None
+    if spec.modality == "iris" and config.iris_unimodal_backbone == "mobilenet_v3_small":
+        mobilenet_size = config.iris_mobilenet_input_size
+        x = layers.Resizing(
+            mobilenet_size,
+            mobilenet_size,
+            interpolation="bilinear",
+            name=f"{spec.modality}_probe_resize",
+        )(inputs)
+        x = layers.Concatenate(name=f"{spec.modality}_probe_rgb")([x, x, x])
+        base_backbone = keras.applications.MobileNetV3Small(
+            input_shape=(mobilenet_size, mobilenet_size, 3),
+            alpha=config.iris_mobilenet_alpha,
+            include_top=False,
+            weights=config.iris_mobilenet_weights,
+            pooling="avg",
+            include_preprocessing=True,
+        )
+        base_backbone.trainable = False
+        feature_extractor = base_backbone
+        x = base_backbone(x)
+        x = layers.Dense(spec.embedding_dim, use_bias=False, name=f"{spec.modality}_probe_base_proj")(x)
+    else:
+        base_backbone = _build_backbone(
+            spec.input_shape,
+            spec.embedding_dim,
+            f"{spec.modality}_probe_backbone_base",
+        )
+        feature_extractor = base_backbone
+        x = base_backbone(inputs)
     x = layers.BatchNormalization(name=f"{spec.modality}_probe_bn_1")(x)
     x = layers.ReLU(name=f"{spec.modality}_probe_relu")(x)
     x = layers.Dense(spec.embedding_dim, use_bias=False, name=f"{spec.modality}_probe_proj")(x)
     outputs = layers.BatchNormalization(name=f"{spec.modality}_probe_bn_2")(x)
     backbone = keras.Model(inputs, outputs, name=f"{spec.modality}_probe_backbone")
+    backbone.feature_extractor = feature_extractor
     head = AdaFaceHead(config.num_classes, name=f"{spec.modality}_probe_head")
     return spec, backbone, head
 
@@ -130,6 +182,47 @@ def _build_training_source(config, modality_index: int):
         return _dataset_iterator()
 
     raise RuntimeError("No training data available for unimodal probe.")
+
+
+def _unimodal_train_steps(config, modality: str) -> int:
+    if modality == "iris" and config.iris_unimodal_backbone == "mobilenet_v3_small":
+        return config.iris_mobilenet_train_steps
+    return config.unimodal_train_steps
+
+
+def _unimodal_learning_rate(config, modality: str) -> float:
+    if modality == "iris" and config.iris_unimodal_backbone == "mobilenet_v3_small":
+        return config.iris_mobilenet_learning_rate
+    return config.unimodal_learning_rate
+
+
+def _unimodal_backbone_training_flag(config, modality: str) -> bool:
+    if modality == "iris" and config.iris_unimodal_backbone == "mobilenet_v3_small":
+        return False
+    return True
+
+
+def _is_mobilenet_unimodal(config, modality: str) -> bool:
+    return modality == "iris" and config.iris_unimodal_backbone == "mobilenet_v3_small"
+
+
+def _set_mobilenet_finetune_trainable(backbone: keras.Model, enabled: bool) -> None:
+    feature_extractor = getattr(backbone, "feature_extractor", None)
+    if feature_extractor is None:
+        return
+    if not enabled:
+        feature_extractor.trainable = False
+        return
+
+    feature_extractor.trainable = True
+    trainable_seen = 0
+    for layer in reversed(feature_extractor.layers):
+        if isinstance(layer, layers.BatchNormalization):
+            layer.trainable = False
+            continue
+        if layer.weights:
+            trainable_seen += 1
+        layer.trainable = trainable_seen <= 20
 
 
 def _split_indices(labels: list[int]) -> tuple[list[int], list[int]]:
@@ -167,12 +260,16 @@ def _evaluate_embeddings(embeddings: tf.Tensor, labels: list[int]) -> tuple[floa
 
 
 def _evaluate_checkpoint_embeddings(
-    backbone: keras.Model,
-    head: AdaFaceHead,
+    config,
+    modality: str,
     checkpoint_path: str,
     eval_inputs: tf.Tensor,
     labels: list[int],
 ) -> tuple[float, float, dict[str, float]] | None:
+    _, backbone, head = _build_unimodal_components(config, modality)
+    _ = backbone(eval_inputs, training=False)
+    sample_raw = backbone(eval_inputs, training=False)
+    _ = head(sample_raw)
     checkpoint = tf.train.Checkpoint(backbone=backbone, head=head)
     try:
         checkpoint.restore(checkpoint_path).expect_partial()
@@ -256,17 +353,25 @@ def _records_to_batch(records, config):
 def train_unimodal_probe(config, modality: str) -> dict[str, object]:
     tf.keras.utils.set_random_seed(config.random_seed)
     spec, backbone, head = _build_unimodal_components(config, modality)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=config.unimodal_learning_rate)
+    train_steps = _unimodal_train_steps(config, spec.modality)
+    mobilenet_mode = _is_mobilenet_unimodal(config, spec.modality)
+    head_steps = min(config.iris_mobilenet_head_steps, train_steps) if mobilenet_mode else train_steps
+    optimizer = tf.keras.optimizers.Adam(learning_rate=_unimodal_learning_rate(config, spec.modality))
+    backbone_training = _unimodal_backbone_training_flag(config, spec.modality)
     source = _build_training_source(config, spec.modality_index)
 
     final_loss = 0.0
     final_cls_loss = 0.0
     final_embedding_loss = 0.0
     final_triplet_loss = 0.0
-    for _ in range(config.unimodal_train_steps):
+    _set_mobilenet_finetune_trainable(backbone, enabled=False)
+    for _ in range(train_steps):
+        if mobilenet_mode and _ == head_steps:
+            _set_mobilenet_finetune_trainable(backbone, enabled=True)
+            optimizer = tf.keras.optimizers.Adam(learning_rate=config.iris_mobilenet_finetune_learning_rate)
         batch_inputs, labels = next(source)
         with tf.GradientTape() as tape:
-            raw_embeddings = backbone(batch_inputs, training=True)
+            raw_embeddings = backbone(batch_inputs, training=backbone_training)
             embeddings = tf.math.l2_normalize(raw_embeddings, axis=-1)
             logits, norms = head(raw_embeddings)
             cls_loss = classification_loss(logits, norms, labels, config)
@@ -297,7 +402,7 @@ def train_unimodal_probe(config, modality: str) -> dict[str, object]:
     save_path = versioned_unimodal_checkpoint_path(
         config,
         spec.modality,
-        config.unimodal_train_steps,
+        train_steps,
     )
     tf.io.gfile.makedirs(config.checkpoint_dir)
     checkpoint = tf.train.Checkpoint(backbone=backbone, head=head)
@@ -309,33 +414,80 @@ def train_unimodal_probe(config, modality: str) -> dict[str, object]:
         "train_final_cls_loss": final_cls_loss,
         "train_final_embedding_loss": final_embedding_loss,
         "train_final_triplet_loss": final_triplet_loss,
+        "train_steps": train_steps,
     }
 
 
 def evaluate_unimodal_probe(config, modality: str) -> dict[str, object]:
-    spec, backbone, head = _build_unimodal_components(config, modality)
+    spec = _spec_for(config, modality)
     records = collect_evaluation_records(config)
     if not records:
         raise RuntimeError("No evaluation data available for unimodal probe.")
 
     inputs, labels_tensor, _ = _records_to_batch(records[:64], config)
     eval_inputs = inputs[spec.modality_index]
-    _ = backbone(eval_inputs, training=False)
-    raw_embeddings = backbone(eval_inputs, training=False)
-    _ = head(raw_embeddings)
-
-    checkpoint_paths = _list_unimodal_checkpoint_paths(config, spec.modality)
-    if not checkpoint_paths:
-        raise RuntimeError(f"Unimodal checkpoint not found for modality: {spec.modality}")
+    best_checkpoint_path = _read_unimodal_best_checkpoint(config, spec.modality)
     labels = labels_tensor.numpy().tolist()
+    if best_checkpoint_path is not None:
+        evaluation = _evaluate_checkpoint_embeddings(
+            config,
+            spec.modality,
+            best_checkpoint_path,
+            eval_inputs,
+            labels,
+        )
+        if evaluation is not None:
+            genuine_mean, impostor_mean, metrics = evaluation
+            _write_unimodal_eer(best_checkpoint_path, metrics["eer"])
+            return {
+                "modality": spec.modality,
+                "checkpoint_path": best_checkpoint_path,
+                "genuine_mean": genuine_mean,
+                "impostor_mean": impostor_mean,
+                "metrics": metrics,
+            }
+
+    latest_checkpoint_path = latest_unimodal_checkpoint_path(config, spec.modality)
+    checkpoint_paths = _list_unimodal_checkpoint_paths(config, spec.modality)
+    if not checkpoint_paths and latest_checkpoint_path is None:
+        raise RuntimeError(f"Unimodal checkpoint not found for modality: {spec.modality}")
+    has_cached_metrics = any(_read_unimodal_eer(path) is not None for path in checkpoint_paths)
     best_result = None
+    if latest_checkpoint_path is not None:
+        evaluation = _evaluate_checkpoint_embeddings(
+            config,
+            spec.modality,
+            latest_checkpoint_path,
+            eval_inputs,
+            labels,
+        )
+        if evaluation is not None:
+            genuine_mean, impostor_mean, metrics = evaluation
+            _write_unimodal_eer(latest_checkpoint_path, metrics["eer"])
+            best_result = {
+                "checkpoint_path": latest_checkpoint_path,
+                "genuine_mean": genuine_mean,
+                "impostor_mean": impostor_mean,
+                "metrics": metrics,
+            }
+            if not has_cached_metrics:
+                _write_unimodal_best_checkpoint(config, spec.modality, latest_checkpoint_path)
+                return {
+                    "modality": spec.modality,
+                    "checkpoint_path": latest_checkpoint_path,
+                    "genuine_mean": genuine_mean,
+                    "impostor_mean": impostor_mean,
+                    "metrics": metrics,
+                }
     for checkpoint_path in checkpoint_paths:
+        if best_result is not None and checkpoint_path == best_result["checkpoint_path"]:
+            continue
         cached_eer = _read_unimodal_eer(checkpoint_path)
         if cached_eer is not None and best_result is not None and cached_eer >= best_result["metrics"]["eer"]:
             continue
         evaluation = _evaluate_checkpoint_embeddings(
-            backbone,
-            head,
+            config,
+            spec.modality,
             checkpoint_path,
             eval_inputs,
             labels,
@@ -354,6 +506,7 @@ def evaluate_unimodal_probe(config, modality: str) -> dict[str, object]:
 
     if best_result is None:
         raise RuntimeError(f"No compatible unimodal checkpoints found for modality: {spec.modality}")
+    _write_unimodal_best_checkpoint(config, spec.modality, best_result["checkpoint_path"])
     return {
         "modality": spec.modality,
         "checkpoint_path": best_result["checkpoint_path"],
