@@ -14,11 +14,49 @@ TensorFlow prototype for face-iris multimodal cancelable biometric template prot
 Use the `d2l` environment:
 
 ```powershell
-& 'D:\miniconda\condabin\conda.bat' run -n d2l python -m src.demo
+& 'D:\Miniconda3\condabin\conda.bat' run -p 'D:\Miniconda\envs\d2l' python -m src.demo
 ```
 
 Minimal training loop:
 
 ```powershell
-& 'D:\miniconda\condabin\conda.bat' run -n d2l python -m src.train
+& 'D:\Miniconda3\condabin\conda.bat' run -p 'D:\Miniconda\envs\d2l' python -m src.train
+```
+
+Evaluation:
+
+```powershell
+& 'D:\Miniconda3\condabin\conda.bat' run -p 'D:\Miniconda\envs\d2l' python -m src.evaluate
+```
+
+## Modes
+
+Set `EXPERIMENT_MODE` before training or evaluation:
+
+- `fusion`: full multimodal pipeline (default)
+- `face_only`: face-only probe model and checkpoint
+- `iris_only`: iris-only probe model and checkpoint
+
+Fusion:
+
+```powershell
+$env:EXPERIMENT_MODE='fusion'
+& 'D:\Miniconda3\condabin\conda.bat' run -p 'D:\Miniconda\envs\d2l' python -m src.train
+& 'D:\Miniconda3\condabin\conda.bat' run -p 'D:\Miniconda\envs\d2l' python -m src.evaluate
+```
+
+Face only:
+
+```powershell
+$env:EXPERIMENT_MODE='face_only'
+& 'D:\Miniconda3\condabin\conda.bat' run -p 'D:\Miniconda\envs\d2l' python -m src.train
+& 'D:\Miniconda3\condabin\conda.bat' run -p 'D:\Miniconda\envs\d2l' python -m src.evaluate
+```
+
+Iris only:
+
+```powershell
+$env:EXPERIMENT_MODE='iris_only'
+& 'D:\Miniconda3\condabin\conda.bat' run -p 'D:\Miniconda\envs\d2l' python -m src.train
+& 'D:\Miniconda3\condabin\conda.bat' run -p 'D:\Miniconda\envs\d2l' python -m src.evaluate
 ```

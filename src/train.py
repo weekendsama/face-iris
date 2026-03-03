@@ -10,6 +10,7 @@ from .data import build_training_batch_iterator, build_training_dataset
 from .losses import compute_total_loss
 from .model import build_model
 from .presets import get_config
+from .probe_unimodal import train_unimodal_probe
 
 
 def make_dummy_batch(config, step: int) -> tuple[tuple[tf.Tensor, tf.Tensor], tf.Tensor]:
@@ -29,17 +30,19 @@ def make_dummy_batch(config, step: int) -> tuple[tuple[tf.Tensor, tf.Tensor], tf
     # Use a staged label schedule so DSH is skipped early, then enabled once
     # every seen class reaches the minimum sample count in the feature bank.
     if step == 0:
-        labels = tf.constant([0, 1, 0, 2], dtype=tf.int32)
+        label_pattern = tf.constant([0, 1, 0, 2], dtype=tf.int32)
     elif step == 1:
-        labels = tf.constant([1, 2, 1, 2], dtype=tf.int32)
+        label_pattern = tf.constant([1, 2, 1, 2], dtype=tf.int32)
     else:
-        labels = tf.constant([0, 1, 2, 0], dtype=tf.int32)
+        label_pattern = tf.constant([0, 1, 2, 0], dtype=tf.int32)
+    repeats = (config.batch_size + int(label_pattern.shape[0]) - 1) // int(label_pattern.shape[0])
+    labels = tf.tile(label_pattern, [repeats])[: config.batch_size]
     return (face, iris), labels
 
 
 def train_step(model, optimizer, inputs, labels, config, step: int):
     dsh_refreshed = False
-    if step % config.dsh_refresh_interval == 0:
+    if config.dsh_refresh_interval > 0 and step % config.dsh_refresh_interval == 0:
         dsh_refreshed = model.refresh_hash_projections(inputs, labels)
 
     with tf.GradientTape() as tape:
@@ -82,6 +85,15 @@ def latest_checkpoint_path(config) -> str | None:
 
 def main() -> None:
     config, preset_name = get_config()
+    if config.training_mode in {"face_only", "iris_only"}:
+        modality = "face" if config.training_mode == "face_only" else "iris"
+        result = train_unimodal_probe(config, modality)
+        print("preset:", preset_name)
+        print("training_mode:", config.training_mode)
+        print("train_final_cls_loss:", f"{result['train_final_cls_loss']:.4f}")
+        print("checkpoint_saved:", result["checkpoint_path"])
+        return
+
     tf.keras.utils.set_random_seed(config.random_seed)
     model = build_model(config)
     optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)

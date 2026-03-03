@@ -112,20 +112,9 @@ class MultimodalCancelableModel(keras.Model):
             config.iris_embedding_dim,
             "iris_backbone",
         )
-        self.face_hash = SmoothBinaryLayer(
-            bits=config.face_embedding_dim,
-            alpha=config.smoothing_alpha,
-            name="face_hash",
-        )
-        self.iris_hash = SmoothBinaryLayer(
-            bits=config.iris_embedding_dim,
-            alpha=config.smoothing_alpha,
-            name="iris_hash",
-        )
-        self.face_project = layers.Dense(config.shared_embedding_dim, activation="relu")
-        self.iris_project = layers.Dense(config.shared_embedding_dim, activation="relu")
-        self.fusion = layers.Dense(config.shared_embedding_dim, activation="relu")
-        self.fusion_norm = layers.LayerNormalization()
+        self.face_project = layers.Dense(config.shared_embedding_dim)
+        self.iris_project = layers.Dense(config.shared_embedding_dim)
+        self.fusion = layers.Dense(config.shared_embedding_dim, activation="gelu")
         self.fusion_dropout = layers.Dropout(0.1)
         self.shared_hash = SmoothBinaryLayer(
             bits=config.shared_hash_bits,
@@ -134,13 +123,6 @@ class MultimodalCancelableModel(keras.Model):
         )
         self.face_classifier = AdaFaceHead(config.num_classes, name="face_logits")
         self.iris_classifier = AdaFaceHead(config.num_classes, name="iris_logits")
-        self.shared_classifier = AdaFaceHead(config.num_classes, name="shared_logits")
-        self._face_feature_bank = defaultdict(
-            lambda: deque(maxlen=config.dsh_bank_per_class)
-        )
-        self._iris_feature_bank = defaultdict(
-            lambda: deque(maxlen=config.dsh_bank_per_class)
-        )
         self._shared_feature_bank = defaultdict(
             lambda: deque(maxlen=config.dsh_bank_per_class)
         )
@@ -186,64 +168,32 @@ class MultimodalCancelableModel(keras.Model):
         iris_raw = self.iris_backbone(iris_inputs, training=False)
         face_embedding = tf.math.l2_normalize(face_raw, axis=-1)
         iris_embedding = tf.math.l2_normalize(iris_raw, axis=-1)
-        face_code = self.face_hash(face_embedding, training=True)
-        iris_code = self.iris_hash(iris_embedding, training=True)
+        fused_inputs = tf.concat(
+            [
+                self.face_project(face_embedding),
+                self.iris_project(iris_embedding),
+            ],
+            axis=-1,
+        )
         fused_raw = self.fusion(
-            self.face_project(face_code) + self.iris_project(iris_code),
+            fused_inputs,
             training=False,
         )
-        fused_raw = self.fusion_norm(fused_raw, training=False)
-        fused_embedding = tf.math.l2_normalize(fused_raw, axis=-1)
+        fused_embedding = fused_raw
         _ = self.shared_hash(fused_embedding, training=True)
-        banked_face = self._update_feature_bank(
-            self._face_feature_bank,
-            face_embedding,
-            labels,
-        )
-        banked_iris = self._update_feature_bank(
-            self._iris_feature_bank,
-            iris_embedding,
-            labels,
-        )
         banked_shared = self._update_feature_bank(
             self._shared_feature_bank,
             fused_embedding,
             labels,
         )
-        if not (
-            self._feature_bank_ready(self._face_feature_bank)
-            and self._feature_bank_ready(self._iris_feature_bank)
-            and self._feature_bank_ready(self._shared_feature_bank)
-        ):
+        if not self._feature_bank_ready(self._shared_feature_bank):
             return False
 
-        face_weights, face_bias = fit_dsh_projections(
-            banked_face.numpy(),
-            num_bits=self.config.face_embedding_dim,
-            num_clusters=self.config.dsh_num_clusters,
-            num_iters=self.config.dsh_kmeans_iters,
-        )
-        iris_weights, iris_bias = fit_dsh_projections(
-            banked_iris.numpy(),
-            num_bits=self.config.iris_embedding_dim,
-            num_clusters=self.config.dsh_num_clusters,
-            num_iters=self.config.dsh_kmeans_iters,
-        )
         shared_weights, shared_bias = fit_dsh_projections(
             banked_shared.numpy(),
             num_bits=self.config.shared_hash_bits,
             num_clusters=self.config.dsh_num_clusters,
             num_iters=self.config.dsh_kmeans_iters,
-        )
-        self.face_hash.set_projections(
-            face_weights,
-            face_bias,
-            mix=self.config.dsh_projection_mix,
-        )
-        self.iris_hash.set_projections(
-            iris_weights,
-            iris_bias,
-            mix=self.config.dsh_projection_mix,
         )
         self.shared_hash.set_projections(
             shared_weights,
@@ -263,16 +213,19 @@ class MultimodalCancelableModel(keras.Model):
         face_embedding = tf.math.l2_normalize(face_raw, axis=-1)
         iris_embedding = tf.math.l2_normalize(iris_raw, axis=-1)
 
-        face_code = self.face_hash(face_embedding, training=training)
-        iris_code = self.iris_hash(iris_embedding, training=training)
-
+        fused_inputs = tf.concat(
+            [
+                self.face_project(face_embedding),
+                self.iris_project(iris_embedding),
+            ],
+            axis=-1,
+        )
         fused_raw = self.fusion(
-            self.face_project(face_code) + self.iris_project(iris_code),
+            fused_inputs,
             training=training,
         )
-        fused_raw = self.fusion_norm(fused_raw, training=training)
         fused_raw = self.fusion_dropout(fused_raw, training=training)
-        fused = tf.math.l2_normalize(fused_raw, axis=-1)
+        fused = fused_raw
         shared_code_soft = self.shared_hash(fused, training=True)
         if training:
             shared_code = shared_code_soft
@@ -280,13 +233,12 @@ class MultimodalCancelableModel(keras.Model):
             shared_code = tf.cast(shared_code_soft >= 0.5, tf.float32)
         face_logits, face_norms = self.face_classifier(face_raw)
         iris_logits, iris_norms = self.iris_classifier(iris_raw)
-        shared_logits, shared_norms = self.shared_classifier(fused_raw)
 
         return {
             "face_embedding": face_embedding,
             "iris_embedding": iris_embedding,
-            "face_code": face_code,
-            "iris_code": iris_code,
+            "face_code": face_embedding,
+            "iris_code": iris_embedding,
             "fused_embedding": fused,
             "shared_code_soft": shared_code_soft,
             "shared_code": shared_code,
@@ -294,8 +246,6 @@ class MultimodalCancelableModel(keras.Model):
             "face_norms": face_norms,
             "iris_logits": iris_logits,
             "iris_norms": iris_norms,
-            "shared_logits": shared_logits,
-            "shared_norms": shared_norms,
         }
 
 

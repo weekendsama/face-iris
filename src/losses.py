@@ -105,6 +105,38 @@ def pairwise_embedding_loss(
     return positive_loss + negative_loss
 
 
+def batch_hard_triplet_loss(
+    embeddings: tf.Tensor,
+    labels: tf.Tensor,
+    margin: float,
+) -> tf.Tensor:
+    labels = tf.cast(labels, tf.int32)
+    embeddings = tf.cast(embeddings, tf.float32)
+
+    diffs = embeddings[:, None, :] - embeddings[None, :, :]
+    distances = tf.sqrt(tf.reduce_sum(tf.square(diffs), axis=-1) + 1e-12)
+
+    same_identity = tf.equal(labels[:, None], labels[None, :])
+    positive_mask = tf.logical_and(same_identity, ~tf.eye(tf.shape(labels)[0], dtype=tf.bool))
+    negative_mask = ~same_identity
+
+    negative_fill = tf.fill(tf.shape(distances), tf.constant(-1e9, dtype=distances.dtype))
+    positive_fill = tf.fill(tf.shape(distances), tf.constant(1e9, dtype=distances.dtype))
+
+    hardest_positive = tf.reduce_max(tf.where(positive_mask, distances, negative_fill), axis=1)
+    hardest_negative = tf.reduce_min(tf.where(negative_mask, distances, positive_fill), axis=1)
+
+    valid_anchor = tf.reduce_any(positive_mask, axis=1) & tf.reduce_any(negative_mask, axis=1)
+    triplet_terms = tf.nn.relu(hardest_positive - hardest_negative + margin)
+    valid_terms = tf.boolean_mask(triplet_terms, valid_anchor)
+
+    return tf.cond(
+        tf.size(valid_terms) > 0,
+        lambda: tf.reduce_mean(valid_terms),
+        lambda: tf.constant(0.0, dtype=tf.float32),
+    )
+
+
 def compute_total_loss(
     outputs: dict[str, tf.Tensor],
     labels: tf.Tensor,
@@ -112,13 +144,7 @@ def compute_total_loss(
 ) -> tuple[tf.Tensor, dict[str, tf.Tensor]]:
     face_cls = classification_loss(outputs["face_logits"], outputs["face_norms"], labels, config)
     iris_cls = classification_loss(outputs["iris_logits"], outputs["iris_norms"], labels, config)
-    shared_cls = classification_loss(
-        outputs["shared_logits"],
-        outputs["shared_norms"],
-        labels,
-        config,
-    )
-    cls_loss = (face_cls + iris_cls + shared_cls) / 3.0
+    cls_loss = (face_cls + iris_cls) / 2.0
 
     pair_loss = pairwise_hash_loss(
         outputs["shared_code"],
@@ -132,16 +158,23 @@ def compute_total_loss(
         config.embedding_positive_target,
         config.embedding_negative_target,
     )
+    triplet_loss = batch_hard_triplet_loss(
+        outputs["fused_embedding"],
+        labels,
+        config.triplet_margin,
+    )
 
     total = (
         config.classification_weight * cls_loss
         + config.pairwise_weight * pair_loss
         + config.embedding_pairwise_weight * embedding_loss
+        + config.triplet_weight * triplet_loss
     )
     metrics = {
         "total_loss": total,
         "classification_loss": cls_loss,
         "pairwise_loss": pair_loss,
         "embedding_pairwise_loss": embedding_loss,
+        "triplet_loss": triplet_loss,
     }
     return total, metrics

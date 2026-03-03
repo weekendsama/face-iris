@@ -49,4 +49,13 @@ def get_config(preset_name: str | None = None) -> tuple[ModelConfig, str]:
     if name not in PRESETS:
         available = ", ".join(sorted(PRESETS))
         raise ValueError(f"Unknown preset '{name}'. Available: {available}")
-    return PRESETS[name], name
+    config = PRESETS[name]
+    mode = os.getenv("EXPERIMENT_MODE")
+    if mode:
+        normalized_mode = mode.strip().lower().replace("-", "_")
+        valid_modes = {"fusion", "face_only", "iris_only"}
+        if normalized_mode not in valid_modes:
+            available = ", ".join(sorted(valid_modes))
+            raise ValueError(f"Unknown training mode '{mode}'. Available: {available}")
+        config = replace(config, training_mode=normalized_mode)
+    return config, name

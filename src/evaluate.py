@@ -17,6 +17,7 @@ from .train import make_dummy_batch, train_step
 from .train import latest_checkpoint_path
 from .model import build_model
 from .presets import get_config
+from .probe_unimodal import evaluate_unimodal_probe
 
 
 def _build_eval_source(config):
@@ -67,9 +68,55 @@ def _compute_pair_metrics(
 
 
 def _compute_verification_metrics(
-    enroll_templates: list[tf.Tensor],
+    enroll_codes: list[tf.Tensor],
     enroll_labels: list[int],
-    probe_templates: list[tf.Tensor],
+    probe_codes: list[tf.Tensor],
+    probe_labels: list[int],
+    block_size: int,
+    num_bits: int,
+) -> dict[str, object]:
+    genuine_scores: list[float] = []
+    impostor_scores: list[float] = []
+    genuine_block_scores: list[float] = []
+    impostor_block_scores: list[float] = []
+
+    protected_enroll_templates: list[tf.Tensor] = []
+    for i in range(len(enroll_codes)):
+        perm, mask = generate_user_key(num_bits, seed=enroll_labels[i] + 1000)
+        protected_enroll_templates.append(protect_template(enroll_codes[i], perm, mask))
+
+    for i in range(len(protected_enroll_templates)):
+        claim_label = enroll_labels[i]
+        perm, mask = generate_user_key(num_bits, seed=claim_label + 1000)
+        for j in range(len(probe_codes)):
+            protected_probe = protect_template(probe_codes[j], perm, mask)
+            global_score = float(hamming_similarity(protected_enroll_templates[i], protected_probe).numpy())
+            block_score = float(
+                blockwise_hamming_similarity(
+                    protected_enroll_templates[i],
+                    protected_probe,
+                    block_size=block_size,
+                ).numpy()
+            )
+            if enroll_labels[i] == probe_labels[j]:
+                genuine_scores.append(global_score)
+                genuine_block_scores.append(block_score)
+            else:
+                impostor_scores.append(global_score)
+                impostor_block_scores.append(block_score)
+
+    return {
+        "genuine_scores": genuine_scores,
+        "impostor_scores": impostor_scores,
+        "genuine_block_scores": genuine_block_scores,
+        "impostor_block_scores": impostor_block_scores,
+    }
+
+
+def _compute_code_verification_metrics(
+    enroll_codes: list[tf.Tensor],
+    enroll_labels: list[int],
+    probe_codes: list[tf.Tensor],
     probe_labels: list[int],
     block_size: int,
 ) -> dict[str, object]:
@@ -78,13 +125,13 @@ def _compute_verification_metrics(
     genuine_block_scores: list[float] = []
     impostor_block_scores: list[float] = []
 
-    for i in range(len(enroll_templates)):
-        for j in range(len(probe_templates)):
-            global_score = float(hamming_similarity(enroll_templates[i], probe_templates[j]).numpy())
+    for i in range(len(enroll_codes)):
+        for j in range(len(probe_codes)):
+            global_score = float(hamming_similarity(enroll_codes[i], probe_codes[j]).numpy())
             block_score = float(
                 blockwise_hamming_similarity(
-                    enroll_templates[i],
-                    probe_templates[j],
+                    enroll_codes[i],
+                    probe_codes[j],
                     block_size=block_size,
                 ).numpy()
             )
@@ -119,6 +166,29 @@ def _compute_soft_verification_metrics(
     for i in range(len(enroll_codes)):
         for j in range(len(probe_codes)):
             score = _soft_similarity(enroll_codes[i], probe_codes[j])
+            if enroll_labels[i] == probe_labels[j]:
+                genuine_scores.append(score)
+            else:
+                impostor_scores.append(score)
+
+    return {
+        "genuine_scores": genuine_scores,
+        "impostor_scores": impostor_scores,
+    }
+
+
+def _compute_embedding_verification_metrics(
+    enroll_embeddings: list[tf.Tensor],
+    enroll_labels: list[int],
+    probe_embeddings: list[tf.Tensor],
+    probe_labels: list[int],
+) -> dict[str, object]:
+    genuine_scores: list[float] = []
+    impostor_scores: list[float] = []
+
+    for i in range(len(enroll_embeddings)):
+        for j in range(len(probe_embeddings)):
+            score = float(tf.tensordot(enroll_embeddings[i], probe_embeddings[j], axes=1).numpy())
             if enroll_labels[i] == probe_labels[j]:
                 genuine_scores.append(score)
             else:
@@ -190,6 +260,12 @@ def _compute_curve_points(
     return points
 
 
+def _mean_score(scores: list[float]) -> float:
+    if not scores:
+        return math.nan
+    return sum(scores) / len(scores)
+
+
 def _export_curve_csv(path: str, points: list[dict[str, float]]) -> None:
     lines = ["threshold,far,frr,tar,trr"]
     for point in points:
@@ -258,6 +334,23 @@ def _records_to_batch(records, config):
 
 def main() -> None:
     config, preset_name = get_config()
+    if config.training_mode in {"face_only", "iris_only"}:
+        modality = "face" if config.training_mode == "face_only" else "iris"
+        result = evaluate_unimodal_probe(config, modality)
+        metrics = result["metrics"]
+        print("preset:", preset_name)
+        print("training_mode:", config.training_mode)
+        print("checkpoint_path:", result["checkpoint_path"])
+        print(
+            "embedding genuine_mean={genuine:.4f} impostor_mean={impostor:.4f} "
+            "threshold={threshold:.4f} FAR={far:.4f} FRR={frr:.4f} EER={eer:.4f}".format(
+                genuine=result["genuine_mean"],
+                impostor=result["impostor_mean"],
+                **metrics,
+            )
+        )
+        return
+
     tf.keras.utils.set_random_seed(config.random_seed)
     model = build_model(config)
     optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
@@ -291,6 +384,8 @@ def main() -> None:
             warmup_losses.append(float(metrics["total_loss"].numpy()))
 
     protected_templates = []
+    raw_codes = []
+    fused_embeddings = []
     soft_templates = []
     all_labels = []
     all_record_ids = []
@@ -307,6 +402,8 @@ def main() -> None:
                 perm, mask = generate_user_key(config.shared_hash_bits, seed=label + 1000)
                 protected = protect_template(shared_codes[idx], perm, mask)
                 protected_templates.append(protected)
+                raw_codes.append(shared_codes[idx])
+                fused_embeddings.append(outputs["fused_embedding"][idx])
                 soft_templates.append(shared_code_soft[idx])
                 all_labels.append(label)
                 all_record_ids.append(record_ids[idx])
@@ -329,11 +426,15 @@ def main() -> None:
                 label = int(labels[idx].numpy())
                 perm, mask = generate_user_key(config.shared_hash_bits, seed=label + 1000)
                 protected_templates.append(protect_template(shared_codes[idx], perm, mask))
+                raw_codes.append(shared_codes[idx])
+                fused_embeddings.append(outputs["fused_embedding"][idx])
                 soft_templates.append(shared_code_soft[idx])
                 all_labels.append(label)
                 all_record_ids.append(record_ids[idx])
 
     templates = tf.stack(protected_templates, axis=0)
+    code_tensor = tf.stack(raw_codes, axis=0)
+    fused_embedding_tensor = tf.stack(fused_embeddings, axis=0)
     soft_code_tensor = tf.stack(soft_templates, axis=0)
     labels = tf.constant(all_labels, dtype=tf.int32)
     pair_metrics = _compute_pair_metrics(templates, labels, config.block_size)
@@ -343,8 +444,12 @@ def main() -> None:
         grouped_indices.setdefault(label, []).append(idx)
 
     enroll_templates = []
+    enroll_codes = []
+    enroll_embeddings = []
     enroll_labels = []
     probe_templates = []
+    probe_codes = []
+    probe_embeddings = []
     probe_labels = []
     enroll_soft_codes = []
     probe_soft_codes = []
@@ -357,9 +462,16 @@ def main() -> None:
             continue
         for idx in enroll_idx:
             enroll_templates.append(templates[idx])
+            enroll_codes.append(code_tensor[idx])
+            enroll_embeddings.append(fused_embedding_tensor[idx])
             enroll_soft_codes.append(soft_code_tensor[idx])
             enroll_labels.append(label)
         for idx in probe_idx:
+            noisy_probe_code = _apply_bit_flip_noise(
+                tf.cast(code_tensor[idx], tf.int32),
+                config.eval_probe_bit_flip_prob,
+                seed=label * 10000 + idx,
+            )
             probe_templates.append(
                 _apply_bit_flip_noise(
                     templates[idx],
@@ -367,13 +479,23 @@ def main() -> None:
                     seed=label * 10000 + idx,
                 )
             )
+            probe_codes.append(tf.cast(noisy_probe_code, tf.float32))
+            probe_embeddings.append(fused_embedding_tensor[idx])
             probe_soft_codes.append(soft_code_tensor[idx])
             probe_labels.append(label)
 
     verification_metrics = _compute_verification_metrics(
-        enroll_templates,
+        enroll_codes,
         enroll_labels,
-        probe_templates,
+        probe_codes,
+        probe_labels,
+        config.block_size,
+        config.shared_hash_bits,
+    )
+    raw_code_metrics = _compute_code_verification_metrics(
+        enroll_codes,
+        enroll_labels,
+        probe_codes,
         probe_labels,
         config.block_size,
     )
@@ -381,15 +503,35 @@ def main() -> None:
     filtered_impostor_scores = verification_metrics["impostor_scores"]
     filtered_genuine_block_scores = verification_metrics["genuine_block_scores"]
     filtered_impostor_block_scores = verification_metrics["impostor_block_scores"]
+    raw_genuine_scores = raw_code_metrics["genuine_scores"]
+    raw_impostor_scores = raw_code_metrics["impostor_scores"]
+    raw_genuine_block_scores = raw_code_metrics["genuine_block_scores"]
+    raw_impostor_block_scores = raw_code_metrics["impostor_block_scores"]
     soft_verification_metrics = _compute_soft_verification_metrics(
         enroll_soft_codes,
         enroll_labels,
         probe_soft_codes,
         probe_labels,
     )
+    embedding_verification_metrics = _compute_embedding_verification_metrics(
+        enroll_embeddings,
+        enroll_labels,
+        probe_embeddings,
+        probe_labels,
+    )
     soft_genuine_scores = soft_verification_metrics["genuine_scores"]
     soft_impostor_scores = soft_verification_metrics["impostor_scores"]
+    embedding_genuine_scores = embedding_verification_metrics["genuine_scores"]
+    embedding_impostor_scores = embedding_verification_metrics["impostor_scores"]
 
+    raw_global_metrics = _compute_far_frr_eer(
+        raw_genuine_scores,
+        raw_impostor_scores,
+    )
+    raw_block_metrics = _compute_far_frr_eer(
+        raw_genuine_block_scores,
+        raw_impostor_block_scores,
+    )
     global_metrics = _compute_far_frr_eer(
         filtered_genuine_scores,
         filtered_impostor_scores,
@@ -401,6 +543,18 @@ def main() -> None:
     soft_metrics = _compute_far_frr_eer(
         soft_genuine_scores,
         soft_impostor_scores,
+    )
+    embedding_metrics = _compute_far_frr_eer(
+        embedding_genuine_scores,
+        embedding_impostor_scores,
+    )
+    raw_global_curve = _compute_curve_points(
+        raw_genuine_scores,
+        raw_impostor_scores,
+    )
+    raw_block_curve = _compute_curve_points(
+        raw_genuine_block_scores,
+        raw_impostor_block_scores,
     )
     global_curve = _compute_curve_points(
         filtered_genuine_scores,
@@ -416,9 +570,13 @@ def main() -> None:
     )
 
     run_stem = Path(ckpt_path).name if ckpt_path is not None else "warmup_only"
+    raw_global_curve_path = str(Path(config.eval_report_dir) / f"{run_stem}_raw_global.csv")
+    raw_block_curve_path = str(Path(config.eval_report_dir) / f"{run_stem}_raw_block.csv")
     global_curve_path = str(Path(config.eval_report_dir) / f"{run_stem}_global.csv")
     block_curve_path = str(Path(config.eval_report_dir) / f"{run_stem}_block.csv")
     soft_curve_path = str(Path(config.eval_report_dir) / f"{run_stem}_soft.csv")
+    _export_curve_csv(raw_global_curve_path, raw_global_curve)
+    _export_curve_csv(raw_block_curve_path, raw_block_curve)
     _export_curve_csv(global_curve_path, global_curve)
     _export_curve_csv(block_curve_path, block_curve)
     _export_curve_csv(soft_curve_path, soft_curve)
@@ -441,6 +599,28 @@ def main() -> None:
     print("verification_genuine_pairs:", len(filtered_genuine_scores))
     print("verification_impostor_pairs:", len(filtered_impostor_scores))
     print(
+        "raw_binary_mean genuine={genuine:.4f} impostor={impostor:.4f}".format(
+            genuine=_mean_score(raw_genuine_scores),
+            impostor=_mean_score(raw_impostor_scores),
+        )
+    )
+    print(
+        "raw_binary_global threshold={threshold:.4f} FAR={far:.4f} FRR={frr:.4f} EER={eer:.4f}".format(
+            **raw_global_metrics,
+        )
+    )
+    print(
+        "raw_binary_block threshold={threshold:.4f} FAR={far:.4f} FRR={frr:.4f} EER={eer:.4f}".format(
+            **raw_block_metrics,
+        )
+    )
+    print(
+        "strict_protected_mean genuine={genuine:.4f} impostor={impostor:.4f}".format(
+            genuine=_mean_score(filtered_genuine_scores),
+            impostor=_mean_score(filtered_impostor_scores),
+        )
+    )
+    print(
         "global threshold={threshold:.4f} FAR={far:.4f} FRR={frr:.4f} EER={eer:.4f}".format(
             **global_metrics,
         )
@@ -451,10 +631,29 @@ def main() -> None:
         )
     )
     print(
+        "fused_embedding_mean genuine={genuine:.4f} impostor={impostor:.4f}".format(
+            genuine=_mean_score(embedding_genuine_scores),
+            impostor=_mean_score(embedding_impostor_scores),
+        )
+    )
+    print(
+        "fused_embedding_cosine threshold={threshold:.4f} FAR={far:.4f} FRR={frr:.4f} EER={eer:.4f}".format(
+            **embedding_metrics,
+        )
+    )
+    print(
+        "soft_code_mean genuine={genuine:.4f} impostor={impostor:.4f}".format(
+            genuine=_mean_score(soft_genuine_scores),
+            impostor=_mean_score(soft_impostor_scores),
+        )
+    )
+    print(
         "soft threshold={threshold:.4f} FAR={far:.4f} FRR={frr:.4f} EER={eer:.4f}".format(
             **soft_metrics,
         )
     )
+    print("raw_global_curve_csv:", raw_global_curve_path)
+    print("raw_block_curve_csv:", raw_block_curve_path)
     print("global_curve_csv:", global_curve_path)
     print("block_curve_csv:", block_curve_path)
     print("soft_curve_csv:", soft_curve_path)
